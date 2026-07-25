@@ -45,19 +45,19 @@ async fn test_signature_verification() {
 
     let instance_id = normfs.get_instance_id().to_string();
 
-    // Wait for WAL rotation and store writes to complete
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    let store_dir = get_queue_store_path(&data_dir, &instance_id, queue_name);
+    let file_id = UintN::from(1u64);
+    let store_file_path = file_id.to_file_path(store_dir.to_str().unwrap(), "store");
+
+    // Wait while the instance is still alive. The flusher that writes store
+    // files stops once it is closed, so a file absent at close time never
+    // appears afterwards and waiting later cannot help.
+    wait_for_store_file(&store_file_path).await;
 
     normfs.close().await.unwrap();
     drop(normfs);
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
     let crypto_ctx = CryptoContext::open(&data_dir).unwrap();
-
-    let store_dir = get_queue_store_path(&data_dir, &instance_id, queue_name);
-    let file_id = UintN::from(1u64);
-    let store_file_path = file_id.to_file_path(store_dir.to_str().unwrap(), "store");
 
     let store_bytes = std::fs::read(&store_file_path).unwrap();
 
@@ -114,19 +114,19 @@ async fn test_signature_verification_fails_on_tampered_header() {
 
     let instance_id = normfs.get_instance_id().to_string();
 
-    // Wait for WAL rotation and store writes to complete
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    let store_dir = get_queue_store_path(&data_dir, &instance_id, queue_name);
+    let file_id = UintN::from(1u64);
+    let store_file_path = file_id.to_file_path(store_dir.to_str().unwrap(), "store");
+
+    // Wait while the instance is still alive. The flusher that writes store
+    // files stops once it is closed, so a file absent at close time never
+    // appears afterwards and waiting later cannot help.
+    wait_for_store_file(&store_file_path).await;
 
     normfs.close().await.unwrap();
     drop(normfs);
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
     let crypto_ctx = CryptoContext::open(&data_dir).unwrap();
-
-    let store_dir = get_queue_store_path(&data_dir, &instance_id, queue_name);
-    let file_id = UintN::from(1u64);
-    let store_file_path = file_id.to_file_path(store_dir.to_str().unwrap(), "store");
 
     let store_bytes = std::fs::read(&store_file_path).unwrap();
 
@@ -181,19 +181,19 @@ async fn test_signature_verification_fails_on_tampered_content() {
 
     let instance_id = normfs.get_instance_id().to_string();
 
-    // Wait for WAL rotation and store writes to complete
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    let store_dir = get_queue_store_path(&data_dir, &instance_id, queue_name);
+    let file_id = UintN::from(1u64);
+    let store_file_path = file_id.to_file_path(store_dir.to_str().unwrap(), "store");
+
+    // Wait while the instance is still alive. The flusher that writes store
+    // files stops once it is closed, so a file absent at close time never
+    // appears afterwards and waiting later cannot help.
+    wait_for_store_file(&store_file_path).await;
 
     normfs.close().await.unwrap();
     drop(normfs);
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
     let crypto_ctx = CryptoContext::open(&data_dir).unwrap();
-
-    let store_dir = get_queue_store_path(&data_dir, &instance_id, queue_name);
-    let file_id = UintN::from(1u64);
-    let store_file_path = file_id.to_file_path(store_dir.to_str().unwrap(), "store");
 
     let store_bytes = std::fs::read(&store_file_path).unwrap();
 
@@ -218,4 +218,25 @@ async fn test_signature_verification_fails_on_tampered_content() {
     );
 
     println!("✓ Content signature verification correctly rejected tampered data!");
+}
+
+/// Waits for the flusher to produce a store file.
+///
+/// The store write is asynchronous: the WAL rotates, then the content is
+/// compressed, encrypted and signed before the file appears. A fixed sleep is
+/// a race that holds on a fast machine and loses on a shared CI runner.
+///
+/// This must be awaited, not blocked on: these are `#[tokio::test]`, so the
+/// runtime is current-thread and the flusher only makes progress while the
+/// test is awaiting.
+async fn wait_for_store_file(path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "store file never appeared: {}",
+            path.display()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }

@@ -18,3 +18,5 @@ normfs-store/c/build/
 
 # Logs
 *.log
+
+build-verify/

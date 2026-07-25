@@ -39,8 +39,12 @@ if(FRAMAC)
     string(REPLACE ";" "," NORMFS_UINTN_VARINT_WP_FCTS_ARG
         "${NORMFS_UINTN_VARINT_WP_FCTS}")
 
+    set(NORMFS_MACHDEP "gcc_x86_64" CACHE STRING
+        "Frama-C machine model (gcc_x86_64, gcc_x86_32, ...)")
+
     add_custom_target(verify-varint
         COMMAND ${FRAMAC}
+            -machdep ${NORMFS_MACHDEP}
             -wp -wp-rte -wp-timeout 60
             -wp-prover alt-ergo,z3
             -wp-par ${NPROC}

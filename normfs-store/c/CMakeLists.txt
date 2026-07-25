@@ -43,8 +43,12 @@ if(FRAMAC)
         set(NPROC 4)
     endif()
 
+    set(NORMFS_MACHDEP "gcc_x86_64" CACHE STRING
+        "Frama-C machine model (gcc_x86_64, gcc_x86_32, ...)")
+
     add_custom_target(verify-store-header
         COMMAND ${FRAMAC}
+            -machdep ${NORMFS_MACHDEP}
             -wp -wp-rte -wp-timeout 240
             -wp-prover alt-ergo,z3
             -wp-par ${NPROC}

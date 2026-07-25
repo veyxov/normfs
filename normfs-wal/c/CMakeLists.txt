@@ -40,8 +40,12 @@ if(FRAMAC)
         normfs_wal_header_v1_roundtrip_holds)
     string(REPLACE ";" "," NORMFS_WP_FCTS_ARG "${NORMFS_WP_FCTS}")
 
+    set(NORMFS_MACHDEP "gcc_x86_64" CACHE STRING
+        "Frama-C machine model (gcc_x86_64, gcc_x86_32, ...)")
+
     add_custom_target(verify-wal-header
         COMMAND ${FRAMAC}
+            -machdep ${NORMFS_MACHDEP}
             -wp -wp-rte -wp-timeout 120
             -wp-prover alt-ergo,z3
             -wp-par ${NPROC}
