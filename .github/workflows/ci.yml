@@ -1,17 +1,25 @@
 name: ci
 
-# Scope is the varint proofs; a branch adding a module adds its verify-* target
-# to verify/Makefile and is picked up without editing this file.
+# Closes #5.
+#
+# The C layer's correctness claim is the proofs, not a test suite, so the
+# proofs have to run here rather than be reported in a PR description. The
+# Rust tests run alongside them.
 on:
   push:
     branches: [main, dev]
   pull_request:
+  # So a run can be triggered by hand on a branch, which is how this was
+  # exercised before any of it had landed on dev.
   workflow_dispatch:
 
+# Nothing here writes to the repository; the proofs and tests only read it.
 permissions:
   contents: read
 
 concurrency:
+  # head_ref so a PR and the push to its branch share a group; github.ref alone
+  # leaves both running.
   group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
@@ -25,7 +33,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      # Not --locked: Cargo.lock is untracked here.
+      # Not --locked: Cargo.lock is not tracked in this repository, so
+      # requiring it would fail before a single test ran.
       - run: cargo test --workspace
 
   build:
@@ -33,10 +42,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # The runner's gcc, not the pinned image: this checks portability.
+      # Deliberately the runner's gcc rather than the pinned image: this job
+      # asks whether the C is portable, not whether it builds under one fixed
+      # compiler. What it certifies therefore moves with ubuntu-latest. The
+      # proofs below are the reproducible claim; this is a portability check.
       - name: Build every C module
         run: make -f verify/Makefile build
 
+  # Built once and shared: both matrix legs otherwise miss the cache together,
+  # build the same image concurrently, and race to save the same key.
   image:
     name: toolchain image
     runs-on: ubuntu-latest
@@ -47,8 +61,9 @@ jobs:
         with:
           path: /tmp/verify-image
           key: verify-image-${{ hashFiles('verify/Dockerfile') }}
-      # if/then, not `[ -f ] && exit 0`: under bash -e a short-circuited &&
-      # fails the step on exactly the cold-cache path this handles.
+      # if/then, not `[ -f ... ] && exit 0`: steps run under bash -e, where a
+      # short-circuited && is itself a non-zero status and fails the step on
+      # exactly the cold-cache path this is meant to handle.
       - name: Build if not cached
         run: |
           if [ ! -f /tmp/verify-image/image.tar ]; then
@@ -58,13 +73,22 @@ jobs:
           fi
 
   proofs:
-    name: WP
+    name: WP (${{ matrix.machdep }})
     runs-on: ubuntu-latest
     needs: image
     timeout-minutes: 60
+    # A bound that carries at 64 bits can fail to carry at 32. The embedded
+    # targets are 32-bit, so a single-model proof run is not evidence.
+    strategy:
+      fail-fast: false
+      matrix:
+        machdep: [gcc_x86_64, gcc_x86_32]
     steps:
       - uses: actions/checkout@v4
 
+      # The image pins Frama-C, Alt-Ergo, Z3, Why3 and the OCaml compiler.
+      # Building it takes ~20 minutes, so it is cached on the Dockerfile hash
+      # and only rebuilt when a version there actually changes.
       - name: Restore the pinned toolchain image
         uses: actions/cache@v4
         with:
@@ -74,21 +98,26 @@ jobs:
       - name: Load the pinned toolchain image
         run: docker load -i /tmp/verify-image/image.tar
 
-      # pipefail: the container's exit status is the whole signal, and tee's
-      # would always be 0.
+      # pipefail is required: the container's exit status is the whole signal,
+      # and without it this step would report tee's status, which is always 0.
       - name: Prove
         shell: bash
         run: |
           set -o pipefail
           docker run --rm -v "$PWD:/work" -w /work normfs-verify:pinned \
-            make -f verify/Makefile verify 2>&1 | tee wp.log
+            make -f verify/Makefile verify MACHDEP=${{ matrix.machdep }} \
+            2>&1 | tee wp-${{ matrix.machdep }}.log
 
+      # check-proved.sh already ruled on every target inside the container and
+      # failed the run if any goal was open. This puts the numbers on the run
+      # page, where they are read, instead of only in the log artifact.
+      # if: always() so a failed proof still reports which module was short.
       - name: Summarise
         if: always()
-        run: ./verify/summarize.sh build-verify/logs >> "$GITHUB_STEP_SUMMARY"
+        run: ./verify/summarize.sh build-verify/logs "${{ matrix.machdep }}" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: wp-log
-          path: wp.log
+          name: wp-${{ matrix.machdep }}
+          path: wp-${{ matrix.machdep }}.log

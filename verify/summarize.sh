@@ -1,6 +1,13 @@
 #!/bin/sh
-# Renders a WP run as a markdown table for $GITHUB_STEP_SUMMARY, so the goal
-# counts land on the run page instead of only in the log artifact.
+# Renders a WP run as a markdown table on the CI run page.
+#
+# The pass/fail tick says only that something was proved or was not. What a
+# reviewer actually wants to know is which module is short, by how many goals,
+# and whether the smoke tests ran — so print that where it is read, rather
+# than leaving it in a log artifact someone has to download first.
+#
+# Reads the per-target logs written by verify/Makefile. Writes markdown to
+# stdout; the workflow redirects it to $GITHUB_STEP_SUMMARY.
 set -eu
 
 logdir="${1:?usage: summarize.sh <log-dir> [machdep]}"

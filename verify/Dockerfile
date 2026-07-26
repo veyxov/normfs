@@ -1,5 +1,9 @@
-# Pinned proof toolchain. Changing any version here changes what "proved"
-# means, so it must be a deliberate commit.
+# Pinned proof toolchain for the NormFS C layer.
+#
+# The proof numbers quoted in the repository are only meaningful if the tool
+# versions that produced them are fixed. Frama-C, Alt-Ergo, Z3 and the OCaml
+# compiler are all pinned here; changing any of them changes what "proved"
+# means and must be a deliberate commit.
 FROM debian:trixie-slim
 
 ARG OCAML_VERSION=4.14.2
@@ -14,8 +18,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV OPAMROOT=/opt/opam
 ENV OPAMYES=1
 
-# graphviz and the GTK packages are depexts of frama-c. Without them opam
-# reports "No solution found" rather than naming what is missing.
+# The depexts are not optional even though nothing here opens a window:
+# frama-c pulls conf-graphviz and lablgtk3-sourceview3, and without the system
+# packages opam reports "No solution found" rather than naming what is missing.
+# Installing the GUI dependencies is what makes the image reproduce the
+# toolchain the proof numbers were measured on.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential ca-certificates cmake curl git m4 unzip \
         pkg-config libgmp-dev libmpfr-dev zlib1g-dev opam \
@@ -23,7 +30,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgtk-3-dev libgtksourceview-3.0-dev libexpat1-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Z3 ships prebuilt; building from source adds ~20 minutes for no benefit.
+# Z3 ships prebuilt; building it from source would add ~20 minutes for no
+# benefit, and the release archive is what everyone else runs.
 RUN curl -fsSL -o /tmp/z3.zip \
         "https://github.com/Z3Prover/z3/releases/download/${Z3_ASSET%%-x64*}/${Z3_ASSET}.zip" \
     && unzip -q /tmp/z3.zip -d /tmp \
@@ -40,12 +48,14 @@ RUN opam init --bare --disable-sandboxing \
 
 ENV PATH=/opt/opam/framac/bin:$PATH
 
-# Detect at build time so every run sees the same prover set.
+# Why3 caches prover detection; doing it at build time keeps every proof run
+# from re-probing and keeps the detected set identical across runs.
 RUN why3 config detect
 
 WORKDIR /work
 
-# Fail at start if a prover is missing, rather than proving fewer goals.
+# Fail loudly at container start if a prover is missing rather than silently
+# proving fewer goals.
 RUN printf '%s\n' \
         '#!/bin/sh' \
         'set -e' \
