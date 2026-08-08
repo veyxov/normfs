@@ -42,7 +42,13 @@
 #elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #define NORMFS_CRC32C_X86 1
 #define NORMFS_CRC32C_HW 1
+/* LLVM 18 split crc32 off sse4.2; compilers predating the split reject the
+ * name, so build.rs probes for it rather than testing a version macro. */
+#if defined(NORMFS_CRC32C_TARGET_CRC32)
+#define NORMFS_CRC32C_HW_TARGET __attribute__((target("sse4.2,crc32")))
+#else
 #define NORMFS_CRC32C_HW_TARGET __attribute__((target("sse4.2")))
+#endif
 #define NORMFS_CRC32C_STEP8(c, w) ((uint32_t)_mm_crc32_u64((uint64_t)(c), (w)))
 #define NORMFS_CRC32C_STEP1(c, b) ((uint32_t)_mm_crc32_u8((c), (b)))
 #include <nmmintrin.h>
