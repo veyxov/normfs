@@ -8,7 +8,9 @@ fn uintn_include_dir(manifest_dir: &Path) -> PathBuf {
     }
 }
 
-fn crc32_target_supported(out_dir: &Path) -> bool {
+// Asks whether the compiler accepts the x86 feature names, not whether the CPU
+// has crc32. aarch64 has its own branch in crc32c.c and never reads this.
+fn x86_crc32_target_supported(out_dir: &Path) -> bool {
     if env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("x86_64") {
         return false;
     }
@@ -69,7 +71,7 @@ fn main() {
         .opt_level(3)
         .warnings(false);
 
-    if crc32_target_supported(&out_dir) {
+    if x86_crc32_target_supported(&out_dir) {
         build.define("NORMFS_CRC32C_TARGET_CRC32", None);
     }
 
