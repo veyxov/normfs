@@ -37,9 +37,10 @@
 #include <arm_acle.h>
 #include <string.h>
 /*
- * build.rs compiles this file for sse4.2, so the intrinsics need no target
- * attribute: LLVM 18 split crc32 off sse4.2 as a separate feature name, and a
- * name the compiler does not know costs a build rather than a fallback.
+ * The build compiles this file for sse4.2, so the intrinsics need no target
+ * attribute. A per-function attribute would have to name every feature the
+ * intrinsic requires, and which names those are moved between compiler
+ * versions, so getting it wrong costs a build rather than a fallback.
  */
 #elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #define NORMFS_CRC32C_X86 1
