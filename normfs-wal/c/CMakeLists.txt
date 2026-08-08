@@ -15,6 +15,9 @@ add_library(normfs_wal_c STATIC
     src/crc32c.c
     src/wal_entry.c
 )
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    target_compile_options(normfs_wal_c PRIVATE -msse4.2)
+endif()
 target_include_directories(normfs_wal_c PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${NORMFS_UINTN_INCLUDE}>

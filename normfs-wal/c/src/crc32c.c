@@ -23,26 +23,28 @@
 #include <string.h>
 /*
  * CRC32 is optional in ARMv8.0 and only mandatory from ARMv8.1, so a build for
- * generic armv8-a leaves __ARM_FEATURE_CRC32 undefined and would otherwise
- * silently take the table path on hardware that has the instruction. Compile
- * the fast path for +crc anyway and select it from AT_HWCAP at runtime.
+ * generic armv8-a leaves __ARM_FEATURE_CRC32 undefined. The fast path is
+ * compiled for +crc regardless: a core without the instruction is not a
+ * supported target.
  */
-#elif defined(__aarch64__) && defined(__linux__) && \
+#elif defined(__aarch64__) && \
     (defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 11))
 #define NORMFS_CRC32C_ARM 1
-#define NORMFS_CRC32C_ARM_RUNTIME 1
 #define NORMFS_CRC32C_HW 1
 #define NORMFS_CRC32C_HW_TARGET __attribute__((target("+crc")))
 #define NORMFS_CRC32C_STEP8(c, w) __crc32cd((c), (w))
 #define NORMFS_CRC32C_STEP1(c, b) __crc32cb((c), (b))
 #include <arm_acle.h>
-#include <asm/hwcap.h>
 #include <string.h>
-#include <sys/auxv.h>
+/*
+ * build.rs compiles this file for sse4.2, so the intrinsics need no target
+ * attribute: LLVM 18 split crc32 off sse4.2 as a separate feature name, and a
+ * name the compiler does not know costs a build rather than a fallback.
+ */
 #elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #define NORMFS_CRC32C_X86 1
 #define NORMFS_CRC32C_HW 1
-#define NORMFS_CRC32C_HW_TARGET __attribute__((target("sse4.2")))
+#define NORMFS_CRC32C_HW_TARGET
 #define NORMFS_CRC32C_STEP8(c, w) ((uint32_t)_mm_crc32_u64((uint64_t)(c), (w)))
 #define NORMFS_CRC32C_STEP1(c, b) ((uint32_t)_mm_crc32_u8((c), (b)))
 #include <nmmintrin.h>
@@ -52,10 +54,6 @@
 #endif
 
 #if defined(NORMFS_CRC32C_HW)
-
-/* Zero until the constructor below runs, so a call from another translation
- * unit's constructor takes the portable path rather than an absent one. */
-extern int normfs_crc32c_hw_supported;
 
 /*@ requires len == 0 || \valid_read(data + (0 .. len - 1));
     assigns \nothing;
@@ -309,26 +307,6 @@ normfs_crc32c_hw(uint32_t crc, const uint8_t *data, size_t len)
 	return ~normfs_crc32c_hw_serial(c, data + i, len - i);
 }
 
-/* Resolved once before main rather than per call: the feature query is not
- * free, and a plain load keeps the dispatcher's "assigns nothing" honest. */
-int normfs_crc32c_hw_supported = 0;
-
-__attribute__((constructor)) static void
-normfs_crc32c_hw_detect(void)
-{
-#if defined(NORMFS_CRC32C_X86)
-	/* libgcc fills in the CPU model from a constructor of its own, and the
-	 * order between the two is unspecified, so ask for it explicitly. */
-	__builtin_cpu_init();
-	normfs_crc32c_hw_supported = __builtin_cpu_supports("sse4.2") ? 1 : 0;
-#elif defined(NORMFS_CRC32C_ARM_RUNTIME)
-	normfs_crc32c_hw_supported =
-	    (getauxval(AT_HWCAP) & HWCAP_CRC32) != 0ul ? 1 : 0;
-#else
-	normfs_crc32c_hw_supported = 1;
-#endif
-}
-
 #endif
 
 /*@ requires len == 0 || \valid_read(data + (0 .. len - 1));
@@ -339,8 +317,8 @@ uint32_t
 normfs_crc32c(uint32_t crc, const uint8_t *data, size_t len)
 {
 #if defined(NORMFS_CRC32C_HW)
-	if (normfs_crc32c_hw_supported != 0)
-		return normfs_crc32c_hw(crc, data, len);
-#endif
+	return normfs_crc32c_hw(crc, data, len);
+#else
 	return normfs_crc32c_portable(crc, data, len);
+#endif
 }

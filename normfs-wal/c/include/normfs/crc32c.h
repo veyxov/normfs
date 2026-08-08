@@ -13,7 +13,8 @@
  * equals the checksum of a concatenated with b. Inversion is handled inside,
  * callers always seed with 0.
  *
- * normfs_crc32c dispatches to a CPU fast path where one is available.
+ * normfs_crc32c uses the CPU instruction. A target whose CPU lacks it is not
+ * supported and faults on the first checksum rather than running slower.
  * normfs_crc32c_portable is the table driven reference.
  *
  * Both carry the same Frama-C contract and both are proven, the dispatcher
