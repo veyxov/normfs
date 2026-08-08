@@ -51,6 +51,7 @@
 #endif
 #define NORMFS_CRC32C_STEP8(c, w) ((uint32_t)_mm_crc32_u64((uint64_t)(c), (w)))
 #define NORMFS_CRC32C_STEP1(c, b) ((uint32_t)_mm_crc32_u8((c), (b)))
+#include <cpuid.h>
 #include <nmmintrin.h>
 #include <string.h>
 #endif
@@ -323,10 +324,16 @@ __attribute__((constructor)) static void
 normfs_crc32c_hw_detect(void)
 {
 #if defined(NORMFS_CRC32C_X86)
-	/* libgcc fills in the CPU model from a constructor of its own, and the
-	 * order between the two is unspecified, so ask for it explicitly. */
-	__builtin_cpu_init();
-	normfs_crc32c_hw_supported = __builtin_cpu_supports("sse4.2") ? 1 : 0;
+	/* CPUID directly rather than __builtin_cpu_supports: that one reads
+	 * libgcc's __cpu_model, which zig's compiler-rt does not carry. */
+	unsigned int eax;
+	unsigned int ebx;
+	unsigned int ecx;
+	unsigned int edx;
+
+	normfs_crc32c_hw_supported =
+	    (__get_cpuid(1u, &eax, &ebx, &ecx, &edx) != 0 &&
+		(ecx & (unsigned int)bit_SSE4_2) != 0u) ? 1 : 0;
 #elif defined(NORMFS_CRC32C_ARM_RUNTIME)
 	normfs_crc32c_hw_supported =
 	    (getauxval(AT_HWCAP) & HWCAP_CRC32) != 0ul ? 1 : 0;
