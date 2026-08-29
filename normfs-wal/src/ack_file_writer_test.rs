@@ -328,7 +328,9 @@ async fn a_record_in_flight_is_not_overtaken_by_the_pages_behind_it() {
 
     let queue = QueueIdResolver::new("test_instance").resolve("order");
     let first = b"AAAA-entry-zero".as_slice();
-    let oversized = vec![b'B'; 5000];
+    // Wide enough to fill its page on its own, so entries 1 and 2 land on
+    // different pages and reach the file as two separate runs.
+    let second = vec![b'B'; crate::page_pool::max_record_len(4096)];
     let third = b"CCCC-entry-two".as_slice();
 
     pool.place(0, first).await.unwrap();
@@ -342,10 +344,10 @@ async fn a_record_in_flight_is_not_overtaken_by_the_pages_behind_it() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    // Entry 1 is larger than a page, so the pool holds it whole; entry 2 lands
-    // in a page. Neither is handed to the writer yet, and several flush ticks
-    // pass while they wait: nothing may reach the file in that window.
-    pool.place(1, &oversized).await.unwrap();
+    // Entry 1 fills a page and entry 2 opens the next one. Neither is handed to
+    // the writer yet, and several flush ticks pass while they wait: nothing may
+    // reach the file in that window.
+    pool.place(1, &second).await.unwrap();
     pool.place(2, third).await.unwrap();
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert_eq!(
@@ -376,10 +378,10 @@ async fn a_record_in_flight_is_not_overtaken_by_the_pages_behind_it() {
             .unwrap_or_else(|| panic!("a record is missing from the file"))
     };
     assert!(
-        at(first) < at(&oversized) && at(&oversized) < at(third),
+        at(first) < at(&second) && at(&second) < at(third),
         "records reached the file out of id order: 0 at {}, 1 at {}, 2 at {}",
         at(first),
-        at(&oversized),
+        at(&second),
         at(third)
     );
 }
@@ -420,5 +422,300 @@ async fn a_restore_cuts_back_to_the_known_good_length() {
     assert_eq!(
         content, b"GOODRETRY",
         "the retry must start at the known-good length, with the torn prefix gone"
+    );
+}
+
+/// A buffered entry is never acked from beyond a pooled one still in its page.
+///
+/// An ack is a durability watermark and the reader of the channel keeps the
+/// highest it has seen, so acking entry 1 says entry 0 is on disk as well. The
+/// two entries take different roads to the file -- one through the buffer, one
+/// from the pool's pages -- and only the flush that carried each may report it.
+/// Draining the ack list wholesale reported both durable when only one was.
+#[tokio::test]
+async fn a_buffered_ack_does_not_report_a_pooled_record_durable() {
+    use crate::page_pool::PagePool;
+    use std::sync::Arc;
+
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("mixed.wal");
+    let (ack_sender, mut ack_receiver) = mpsc::unbounded_channel();
+
+    let pool = Arc::new(PagePool::new(4, 4096, 0));
+    pool.set_drainer();
+    pool.arm_file_fill(10 * 1024 * 1024, 4);
+
+    let settings = AckFileWriterSettings {
+        max_buffer_size: 1024 * 1024,
+        max_file_size: 10 * 1024 * 1024,
+        write_interval: Duration::from_millis(10),
+        fsync: true,
+    };
+    let mut writer = AckFileWriter::new(
+        &file_path,
+        settings,
+        ack_sender,
+        Bytes::from_static(b"HDR!"),
+        Some(Arc::clone(&pool)),
+        0,
+    )
+    .await
+    .unwrap();
+
+    let queue = QueueIdResolver::new("test_instance").resolve("mixed");
+
+    // Entry 0 is in a page and is deliberately never handed over, so no flush
+    // may write it: `take_pending` stops at the handover bound.
+    pool.place(0, b"pooled-entry-zero".as_slice()).await.unwrap();
+    writer
+        .write_maybe_pooled(queue.clone(), UintN::from(0u64), Bytes::new(), true)
+        .await;
+
+    // Entry 1 goes through the buffer, so a flush does write it.
+    writer
+        .write_maybe_pooled(
+            queue.clone(),
+            UintN::from(1u64),
+            Bytes::from_static(b"buffered-entry-one"),
+            false,
+        )
+        .await;
+
+    // Several flush ticks. Entry 1 reaches the file; entry 0 cannot.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        pool.durable_before(),
+        0,
+        "entry 0 was never handed over, so nothing may have written it"
+    );
+    assert!(
+        read_file_content(&file_path).await.windows(18).any(|w| w == b"buffered-entry-one"),
+        "entry 1 should have been written from the buffer"
+    );
+    assert!(
+        ack_receiver.try_recv().is_err(),
+        "acking entry 1 reports entry 0 durable as well, and entry 0 is still in its page"
+    );
+
+    // Once entry 0 is handed over and flushed, both are durable and the
+    // watermark may move -- to the highest, which covers both.
+    pool.note_handed_over(0);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while pool.durable_before() < 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "entry 0 never reached the file"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    writer.close().await.unwrap();
+
+    let mut highest = None;
+    while let Ok((_, id)) = ack_receiver.try_recv() {
+        highest = Some(id);
+    }
+    assert_eq!(
+        highest,
+        Some(UintN::from(1u64)),
+        "both entries are on disk now, so the watermark should have reached entry 1"
+    );
+}
+
+/// An entry buffered while a flush's file I/O is in flight is not acked by
+/// that flush. The one-byte buffer bound starts a flush on every write, and
+/// fsync yields mid-I/O on this single-threaded runtime, so writing the next
+/// entry the moment the previous one appears in the file lands it inside the
+/// window where the flush has written but not yet drained its acks.
+#[tokio::test]
+async fn an_entry_buffered_during_a_flush_is_not_acked_by_it() {
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("during.wal");
+    let (ack_sender, mut ack_receiver) = mpsc::unbounded_channel();
+
+    let settings = AckFileWriterSettings {
+        max_buffer_size: 1,
+        max_file_size: 10 * 1024 * 1024,
+        write_interval: Duration::from_secs(3600),
+        fsync: true,
+    };
+    let mut writer = AckFileWriter::new(
+        &file_path,
+        settings,
+        ack_sender,
+        Bytes::from_static(b"HDR!"),
+        None,
+        0,
+    )
+    .await
+    .unwrap();
+    let queue = QueueIdResolver::new("test_instance").resolve("during");
+
+    let payload = |id: u64| format!("entry-{id:03}-payload");
+    let assert_acked_bytes_on_disk = |id: UintN| {
+        let id = id.to_u64().unwrap();
+        let pat = payload(id);
+        let content = fs::read(&file_path).unwrap();
+        assert!(
+            content.windows(pat.len()).any(|w| w == pat.as_bytes()),
+            "entry {id} was acked while its bytes were still in the buffer"
+        );
+    };
+
+    const ENTRIES: u64 = 20;
+    for i in 0..ENTRIES {
+        let body = Bytes::from(payload(i));
+        writer
+            .write_maybe_pooled(queue.clone(), UintN::from(i), body.clone(), false)
+            .await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let on_disk = fs::read(&file_path)
+                .unwrap()
+                .windows(body.len())
+                .any(|w| w == &body[..]);
+            while let Ok((_, id)) = ack_receiver.try_recv() {
+                assert_acked_bytes_on_disk(id);
+            }
+            if on_disk {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "entry {i} never reached the file"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    writer.close().await.unwrap();
+    let mut highest = None;
+    while let Ok((_, id)) = ack_receiver.try_recv() {
+        assert_acked_bytes_on_disk(id.clone());
+        highest = Some(id.to_u64().unwrap());
+    }
+    assert_eq!(
+        highest,
+        Some(ENTRIES - 1),
+        "the closing flush reports the last entry once its bytes are down"
+    );
+}
+
+/// A durable buffered entry's ack arrives without another write and without a
+/// close. The stranding shape: the entry's bytes are written while a pooled
+/// ack ahead of it holds the cut at zero, the pool's flush later drains only
+/// its own ids, and the ack is left at the head, durable, waiting for a flush
+/// with no other reason to run.
+#[tokio::test]
+async fn a_durable_buffered_ack_is_sent_without_another_write_or_a_close() {
+    use crate::page_pool::PagePool;
+    use std::sync::Arc;
+
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("stranded.wal");
+    let (ack_sender, mut ack_receiver) = mpsc::unbounded_channel();
+
+    let pool = Arc::new(PagePool::new(4, 4096, 0));
+    pool.set_drainer();
+    pool.arm_file_fill(10 * 1024 * 1024, 4);
+
+    let settings = AckFileWriterSettings {
+        max_buffer_size: 1024 * 1024,
+        max_file_size: 10 * 1024 * 1024,
+        write_interval: Duration::from_millis(10),
+        fsync: true,
+    };
+    let writer = AckFileWriter::new(
+        &file_path,
+        settings,
+        ack_sender,
+        Bytes::from_static(b"HDR!"),
+        Some(Arc::clone(&pool)),
+        0,
+    )
+    .await
+    .unwrap();
+    let queue = QueueIdResolver::new("test_instance").resolve("stranded");
+
+    // Entry 0 in a page, not yet handed over; entry 1 through the buffer.
+    pool.place(0, b"pooled-entry-zero".as_slice()).await.unwrap();
+    writer
+        .write_maybe_pooled(queue.clone(), UintN::from(0u64), Bytes::new(), true)
+        .await;
+    writer
+        .write_maybe_pooled(
+            queue.clone(),
+            UintN::from(1u64),
+            Bytes::from_static(b"buffered-entry-one"),
+            false,
+        )
+        .await;
+
+    // Entry 1's bytes reach the file behind the held cut; then entry 0 is
+    // handed over and becomes durable, draining its own ack.
+    pool.note_handed_over(0);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while pool.durable_before() < 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "entry 0 never reached the file"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // No further write and no close: the ack for entry 1 must still arrive.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let watermark = loop {
+        if let Ok((_, id)) = ack_receiver.try_recv() {
+            if id == UintN::from(1u64) {
+                break id;
+            }
+            continue;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the ack for entry 1 is stranded: its bytes are durable but nothing \
+             delivers it until the next write or the close"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert_eq!(watermark, UintN::from(1u64));
+    drop(writer);
+}
+
+/// A close whose final flush cannot write reports the failure instead of
+/// returning Ok: `rotate` keys wal_complete on this, and an Ok here would
+/// have the store worker archive a truncated file. /dev/full accepts the
+/// empty header (nothing to flush) and then refuses every write.
+#[tokio::test]
+async fn a_close_that_cannot_flush_says_so() {
+    if !Path::new("/dev/full").exists() {
+        return;
+    }
+    let (ack_sender, _ack_receiver) = mpsc::unbounded_channel();
+    let settings = AckFileWriterSettings {
+        max_buffer_size: 1024 * 1024,
+        max_file_size: 10 * 1024 * 1024,
+        write_interval: Duration::from_secs(3600),
+        fsync: false,
+    };
+    let mut writer = AckFileWriter::new(
+        "/dev/full",
+        settings,
+        ack_sender,
+        Bytes::new(),
+        None,
+        0,
+    )
+    .await
+    .expect("an empty header has nothing to flush, so construction succeeds");
+
+    let queue = QueueIdResolver::new("test_instance").resolve("full");
+    writer
+        .write_maybe_pooled(queue, UintN::from(0u64), Bytes::from_static(b"doomed"), false)
+        .await;
+
+    assert!(
+        writer.close().await.is_err(),
+        "the closing flush lost this entry's bytes, and close() must say so"
     );
 }

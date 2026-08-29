@@ -81,16 +81,28 @@ impl FileTail {
 }
 
 #[derive(Debug)]
+struct PendingAck {
+    queue_id: QueueId,
+    entry_id: UintN,
+    buffered: bool,
+}
+
+#[derive(Debug)]
 struct WriterState {
     buffer: BytesMut,
-    acks: Vec<(QueueId, UintN)>,
+    /// One per entry handed to this writer, in the order they were handed
+    /// over, with `buffered` saying whether its bytes went into `buffer` or
+    /// stayed in the pool's pages. An ack is a durability watermark, so a
+    /// flush may only drain the entries it has actually made durable -- and
+    /// which flush that is depends on where the bytes were.
+    acks: Vec<PendingAck>,
     current_size: u64,
 }
 
 pub struct AckFileWriter {
     settings: AckFileWriterSettings,
     state: Arc<Mutex<WriterState>>,
-    writer_handle: Mutex<Option<JoinHandle<()>>>,
+    writer_handle: Mutex<Option<JoinHandle<bool>>>,
     shutdown_tx: mpsc::Sender<()>,
     buffer_full_notify: Arc<Notify>,
     pooled: bool,
@@ -119,10 +131,10 @@ async fn flush_pool(
     pool: &Arc<PagePool>,
     epoch: u64,
     fsync: bool,
-) {
+) -> bool {
     let pending = pool.take_pending(epoch);
     if pending.is_empty() {
-        return;
+        return true;
     }
 
     let total: u64 = pending.iter().map(|(_, b)| b.len() as u64).sum();
@@ -203,7 +215,7 @@ async fn flush_pool(
              the next flush",
             path.display()
         );
-        return;
+        return false;
     }
     tail_guard.flushed_len += total;
     for (write, _) in &pending {
@@ -227,13 +239,13 @@ async fn flush_pool(
         let cut = state_guard
             .acks
             .iter()
-            .position(|(_, id)| !id.to_u64().is_ok_and(|v| v <= last))
+            .position(|a| !a.entry_id.to_u64().is_ok_and(|v| v <= last))
             .unwrap_or(state_guard.acks.len());
-        let mut done: Vec<(QueueId, UintN)> = state_guard.acks.drain(0..cut).collect();
+        let mut done: Vec<PendingAck> = state_guard.acks.drain(0..cut).collect();
         done.pop()
     };
     if let Some(ack) = ack
-        && ack_sender.send(ack).is_err()
+        && ack_sender.send((ack.queue_id, ack.entry_id)).is_err()
     {
         log::error!(
             target: "normfs",
@@ -241,6 +253,7 @@ async fn flush_pool(
             path.display(),
         );
     }
+    true
 }
 
 const MAX_RETRIES: u32 = 1000;
@@ -325,7 +338,7 @@ impl AckFileWriter {
 
     /// `in_pool` says the record's bytes are the pool's to hand over, so they
     /// must not be buffered again here. With a pool that is every record: one
-    /// larger than a page is held whole by the pool rather than routed round it.
+    /// no page can hold was refused before it was given an id.
     ///
     /// A pooled record is not counted into `current_size` either. That counter
     /// exists only to answer `can_add`, and `can_add` is not consulted on the
@@ -347,11 +360,16 @@ impl AckFileWriter {
     ) {
         let mut state = self.state.lock().await;
 
-        if !(self.pooled && in_pool) {
+        let buffered = !(self.pooled && in_pool);
+        if buffered {
             state.buffer.extend_from_slice(&entry);
             state.current_size += entry.len() as u64;
         }
-        state.acks.push((queue_id, entry_id));
+        state.acks.push(PendingAck {
+            queue_id,
+            entry_id,
+            buffered,
+        });
 
         if state.buffer.len() >= self.settings.max_buffer_size {
             self.buffer_full_notify.notify_one();
@@ -361,7 +379,12 @@ impl AckFileWriter {
     pub async fn close(&mut self) -> std::io::Result<()> {
         let _ = self.shutdown_tx.send(()).await;
         if let Some(handle) = self.writer_handle.lock().await.take() {
-            handle.await.map_err(std::io::Error::other)?;
+            let clean = handle.await.map_err(std::io::Error::other)?;
+            if !clean {
+                return Err(std::io::Error::other(
+                    "the closing flush could not write everything owed to the file",
+                ));
+            }
         }
         Ok(())
     }
@@ -377,7 +400,7 @@ async fn writer_task(
     ack_sender: mpsc::UnboundedSender<(QueueId, UintN)>,
     pool: Option<Arc<PagePool>>,
     epoch: u64,
-) {
+) -> bool {
     let mut interval = tokio::time::interval(settings.write_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
 
@@ -385,11 +408,14 @@ async fn writer_task(
         tokio::select! {
             biased;
             _ = shutdown_rx.recv() => {
-                flush(&path, &file, &state, &ack_sender, &pool, epoch, settings.fsync).await;
-                break;
+                // The task's return value: whether the closing flush wrote
+                // everything owed. Mid-life flushes may fail and retry, but a
+                // failure here has no next flush behind it, and `close()`
+                // must not report a file complete that is missing its tail.
+                return flush(&path, &file, &state, &ack_sender, &pool, epoch, settings.fsync).await;
             }
             _ = buffer_full_notify.notified() => {
-                flush(&path, &file, &state, &ack_sender, &pool, epoch, settings.fsync).await;
+                let _ = flush(&path, &file, &state, &ack_sender, &pool, epoch, settings.fsync).await;
             }
             // The timer is what a queue nobody writes to often depends on:
             // nothing else on this path can start a flush, so one record on an
@@ -400,24 +426,32 @@ async fn writer_task(
             // the pool lock and walking every page.
             _ = interval.tick() => {
                 if has_pending(&state, &pool).await {
-                    flush(&path, &file, &state, &ack_sender, &pool, epoch, settings.fsync).await;
+                    let _ = flush(&path, &file, &state, &ack_sender, &pool, epoch, settings.fsync).await;
                 }
             }
         }
     }
 }
 
-/// Whether either store owes the file bytes. Both are cheap: a length and a
-/// counter.
+/// Whether either store owes the file bytes, or the channel an ack. All
+/// cheap: two lengths and a counter.
 async fn has_pending(state: &Arc<Mutex<WriterState>>, pool: &Option<Arc<PagePool>>) -> bool {
-    if !state.lock().await.buffer.is_empty() {
-        return true;
+    {
+        let state = state.lock().await;
+        // A leading buffered ack counts as pending on its own: its bytes may
+        // already be durable, and only a flush's empty-buffer pass will send
+        // it. A pooled ack at the head does not count -- no flush can move it
+        // until the pool does, and the pool check below says whether it will.
+        if !state.buffer.is_empty() || buffered_run_len(&state) > 0 {
+            return true;
+        }
     }
     pool.as_ref().is_some_and(|p| p.has_pending())
 }
 
 /// Sends the flush to whichever holds the unwritten bytes: the pool if this
-/// writer was given one, the entry buffer otherwise.
+/// writer was given one, the entry buffer otherwise. False when something
+/// owed to the file is still unwritten.
 async fn flush(
     path: &Path,
     file: &Arc<Mutex<FileTail>>,
@@ -426,7 +460,7 @@ async fn flush(
     pool: &Option<Arc<PagePool>>,
     epoch: u64,
     fsync: bool,
-) {
+) -> bool {
     // Buffer first, then pages. With a pool the buffer is always empty --
     // everything the pool accepted comes out of `take_pending`, in one id
     // order -- so this is the unpooled path only, and the two never mix within
@@ -438,11 +472,12 @@ async fn flush(
     // them, and V1's positional ids would hand every payload after that point
     // out under the wrong id.
     if !flush_buffer(path, file, state, ack_sender, fsync).await {
-        return;
+        return false;
     }
     if let Some(pool) = pool {
-        flush_pool(path, file, state, ack_sender, pool, epoch, fsync).await;
+        return flush_pool(path, file, state, ack_sender, pool, epoch, fsync).await;
     }
+    true
 }
 
 /// False when the buffer still owes the file bytes, so nothing may be written
@@ -454,21 +489,25 @@ async fn flush_buffer(
     ack_sender: &mpsc::UnboundedSender<(QueueId, UintN)>,
     fsync: bool,
 ) -> bool {
-    let (data_to_write, acks_to_send) = {
+    let (data_to_write, ack_cut) = {
         let mut state_guard = state.lock().await;
         if state_guard.buffer.is_empty() {
+            // Nothing owed. Any buffered entry still at the head of the list
+            // was written and synced by an earlier flush -- a failed one puts
+            // its bytes back, so an empty buffer means every buffered byte
+            // reached the file -- and reporting it here is what stops it
+            // waiting for a flush that has no work of its own to do.
+            let cut = buffered_run_len(&state_guard);
+            let ack = take_buffered_ack(&mut state_guard, cut);
+            drop(state_guard);
+            send_ack(ack, ack_sender);
             return true;
         }
-        let data = state_guard.buffer.split().freeze();
-        let mut acks = std::mem::take(&mut state_guard.acks);
-
-        let acks_to_send = if let Some(last_ack) = acks.pop() {
-            vec![last_ack]
-        } else {
-            vec![]
-        };
-
-        (data, acks_to_send)
+        // Under the same lock as the split, so the cut names exactly the
+        // entries whose bytes are in `data_to_write`. Anything buffered during
+        // the file I/O below waits for the flush that writes its bytes.
+        let cut = buffered_run_len(&state_guard);
+        (state_guard.buffer.split().freeze(), cut)
     };
 
     if data_to_write.is_empty() {
@@ -538,27 +577,54 @@ async fn flush_buffer(
     drop(tail_guard);
 
     if write_successful {
-        for (queue_id, entry_id) in acks_to_send {
-            if let Err(e) = ack_sender.send((queue_id, entry_id)) {
-                log::debug!(target: "normfs", "FATAL: Failed to send ack for written data: {}. The application integrity is compromised.", e);
-            }
-        }
+        let mut state_guard = state.lock().await;
+        let ack = take_buffered_ack(&mut state_guard, ack_cut);
+        drop(state_guard);
+        send_ack(ack, ack_sender);
     } else {
         log::error!(target: "normfs", "All write attempts failed. Returning data to buffer to prevent loss.");
+        // Only the bytes come back. The acks were never taken: they are drained
+        // once the bytes they describe are on disk and not before, so a failed
+        // attempt has nothing to undo.
         let mut state_guard = state.lock().await;
         let mut new_buffer =
             BytesMut::with_capacity(data_to_write.len() + state_guard.buffer.len());
         new_buffer.extend_from_slice(&data_to_write);
         new_buffer.extend_from_slice(&state_guard.buffer);
         state_guard.buffer = new_buffer;
-
-        // Return acks as well
-        let mut new_acks = acks_to_send;
-        new_acks.append(&mut state_guard.acks);
-        state_guard.acks = new_acks;
     }
 
     write_successful
+}
+
+/// How many acks at the head of the list describe buffered bytes. Only valid
+/// under the state lock; callers capture it beside the `split()` rather than
+/// recomputing it after the file I/O.
+fn buffered_run_len(state: &WriterState) -> usize {
+    state
+        .acks
+        .iter()
+        .position(|a| !a.buffered)
+        .unwrap_or(state.acks.len())
+}
+
+/// Takes the first `cut` acks and returns the highest of them to report.
+///
+/// An ack is a watermark, so it may only ever name bytes the file already
+/// has. `cut` was captured at split time, which keeps out entries buffered
+/// during the flush's file I/O, and the run stops at the first pooled entry,
+/// which keeps out records still sitting in their pages.
+fn take_buffered_ack(state: &mut WriterState, cut: usize) -> Option<PendingAck> {
+    let mut done: Vec<PendingAck> = state.acks.drain(0..cut).collect();
+    done.pop()
+}
+
+fn send_ack(ack: Option<PendingAck>, ack_sender: &mpsc::UnboundedSender<(QueueId, UintN)>) {
+    if let Some(ack) = ack
+        && let Err(e) = ack_sender.send((ack.queue_id, ack.entry_id))
+    {
+        log::debug!(target: "normfs", "FATAL: Failed to send ack for written data: {}. The application integrity is compromised.", e);
+    }
 }
 
 impl Drop for AckFileWriter {

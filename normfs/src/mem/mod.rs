@@ -8,10 +8,9 @@ use normfs_types::{DataSource, QueueId, ReadEntry, SubscriberCallback};
 use normfs_wal::{AppendOutcome, PagePool, Placement, WalArena};
 use uintn::UintN;
 
-// Geometry of the in-memory paged store. A record larger than a page is not
-// cached and is served from file; the ring caps a queue's cache at
-// MEM_MAX_PAGES pages.
-const MEM_PAGE_SIZE: usize = 256 * 1024;
+// Geometry of the in-memory paged store. Every record fits a page -- one that
+// does not is refused before it is given an id -- and the ring caps a queue's
+// cache at MEM_MAX_PAGES pages.
 const MEM_MAX_PAGES: usize = 64;
 
 /// The fewest pages a queue can work with: one to append into, and one the
@@ -296,13 +295,23 @@ impl MemQueue {
             if pool.has_drainer() {
                 placement = match pool.place(id_to_u64(&id), &data).await {
                     Ok(placed) => placed,
+                    Err(normfs_wal::PoolError::NoDrainer) => {
+                        // The queue closed while this append waited for a
+                        // page. The record reaches no file; the writer is
+                        // gone, so the send below fails and the caller sees
+                        // the error.
+                        log::warn!(
+                            target: "normfs-mem",
+                            "entry {id} arrived while the queue was closing; it reaches no file"
+                        );
+                        Placement::legacy()
+                    }
                     Err(e) => {
-                        // The only error left is a record wider than the V1
-                        // frame, and `NormFS::enqueue` refuses one before it
-                        // takes an id. A record merely larger than a page is
-                        // not an error any more -- the pool holds it whole and
-                        // hands it over in its turn, which is what keeps it in
-                        // the sequence rather than beside it.
+                        // Unreachable through `NormFS::enqueue`, which refuses
+                        // a record no page can hold before it takes an id --
+                        // with the same arithmetic the pool uses, so the two
+                        // cannot disagree. Reaching this arm means that guard
+                        // was bypassed.
                         log::error!(
                             target: "normfs-mem",
                             "entry {id} of {} bytes was accepted and cannot be written ({e:?}): \
@@ -531,9 +540,9 @@ impl MemQueue {
             }
 
             // The floor can rise between the min_cached check and the pin --
-            // an oversize release, a page leaving the ring -- and the run then
-            // starts above `start_id`. A truncated range must go to the files,
-            // not out as a success.
+            // a page leaving the ring -- and the run then starts above
+            // `start_id`. A truncated range must go to the files, not out as
+            // a success.
             if ring.min_cached_id().is_none_or(|m| UintN::from(m) > start_id) {
                 return MemReadResult::fail();
             }
@@ -721,18 +730,31 @@ impl MemQueue {
                             current_id = current_id.step_by(step);
                         }
                     }
-                    // The floor can rise between the check and the pin -- an
-                    // oversize release, a page leaving the ring -- and the run
-                    // above starts past the ids this follow owes. Re-checked
-                    // now that the survivors are pinned: a truncated backlog
-                    // must go to the files, not out as a success.
+                    // The floor can rise between the check and the pin -- a
+                    // page leaving the ring -- and the run above starts past
+                    // the ids this follow owes. Re-checked now that the
+                    // survivors are pinned: a truncated backlog must go to
+                    // the files, not out as a success.
                     if backlog && !covered(ring.min_cached_id()) {
                         return MemReadResult::fail();
                     }
                     let last_id = entries.last().map(|(id, _)| id.clone());
                     (entries, last_id)
                 }
-                _ => (Vec::new(), None),
+                _ => {
+                    // An empty ring holds none of the backlog either: after a
+                    // recovery-style start the ids below `last_id` exist only
+                    // on disk, and subscribing here would hand the client the
+                    // future while silently skipping its past.
+                    let backlog = inner
+                        .last_id
+                        .as_ref()
+                        .is_some_and(|last| start_id <= *last);
+                    if backlog {
+                        return MemReadResult::fail();
+                    }
+                    (Vec::new(), None)
+                }
             }
         };
 
@@ -1021,25 +1043,40 @@ impl MemQueue {
 }
 
 impl MemStore {
-    pub fn new(max_memory_usage: usize) -> Self {
-        Self::with_page_size(max_memory_usage, MEM_PAGE_SIZE)
-    }
-
-    /// As [`MemStore::new`], with the memory page size chosen rather than
-    /// fixed.
+    /// Allocates the arena: `max_memory_usage / page_size` pages, shared by
+    /// every queue.
     ///
-    /// A WAL file ends on a page boundary, so this is also the granularity at
-    /// which a file tracks `max_file_size`: crossing the threshold seals the
-    /// active page, and the tail of that page goes unused. A test that wants
-    /// many small files wants a small page here.
-    pub fn with_page_size(max_memory_usage: usize, page_size: usize) -> Self {
-        let pages = (max_memory_usage / page_size).max(MEM_MIN_PAGES_PER_QUEUE);
-        MemStore {
+    /// A WAL file ends on a page boundary, so `page_size` is also the
+    /// granularity at which a file tracks `max_file_size`: crossing the
+    /// threshold seals the active page, and the tail of that page goes unused.
+    /// A test that wants many small files wants a small page here.
+    ///
+    /// A budget too small for [`MEM_MIN_PAGES_PER_QUEUE`] pages is an error
+    /// rather than a floor. Rounding it up is how `max_memory_usage` stops
+    /// meaning what it says -- at a 4 MiB page a 1 MiB budget would silently
+    /// allocate 8 MiB -- and the pool exists to make that number true.
+    pub fn with_page_size(max_memory_usage: usize, page_size: usize) -> Result<Self, crate::Error> {
+        if page_size < normfs_wal::MIN_PAGE_SIZE {
+            return Err(crate::Error::PageBelowMinimum {
+                page_size,
+                minimum: normfs_wal::MIN_PAGE_SIZE,
+            });
+        }
+        let needed = MEM_MIN_PAGES_PER_QUEUE.saturating_mul(page_size);
+        let pages = max_memory_usage / page_size.max(1);
+        if pages < MEM_MIN_PAGES_PER_QUEUE {
+            return Err(crate::Error::MemoryBelowFloor {
+                max_memory_usage,
+                page_size,
+                needed,
+            });
+        }
+        Ok(MemStore {
             queues: RwLock::new(HashMap::new()),
             arena: Arc::new(WalArena::new(pages, page_size)),
             page_size,
             next_ring_id: AtomicU64::new(0),
-        }
+        })
     }
 
     /// The shared page arena, for tests that assert on who holds what.
