@@ -629,6 +629,14 @@ impl PagePool {
         arena.forget_label(inner.ring.ring_id());
     }
 
+    /// Whether every record in every page is on disk: what a close needs to
+    /// know before it certifies anything.
+    pub fn is_fully_durable(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let essential = inner.ring.min_essential_id();
+        (0..inner.ring.page_count()).all(|k| inner.ring.page_is_reusable(k, essential))
+    }
+
     /// Whether a file writer is taking pages from this pool, and therefore
     /// whether waiting for a page can ever end.
     pub fn has_drainer(&self) -> bool {

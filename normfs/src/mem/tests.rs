@@ -1,4 +1,5 @@
 use super::MemStore;
+use crate::config::PoolKind;
 use bytes::Bytes;
 use normfs_types::{QueueId, QueueIdResolver};
 use std::sync::Arc;
@@ -15,7 +16,7 @@ const TEST_INSTANCE_ID: &str = "test-instance";
 const TEST_PAGE_SIZE: usize = 256 * 1024;
 
 fn mem_store(max_memory_usage: usize) -> MemStore {
-    MemStore::with_page_size(max_memory_usage, TEST_PAGE_SIZE)
+    MemStore::with_pools(max_memory_usage, TEST_PAGE_SIZE, 64 * 1024, 1024)
         .expect("test budget holds a queue's floor")
 }
 
@@ -26,13 +27,13 @@ fn create_test_data(count: usize) -> Vec<Bytes> {
 }
 
 async fn setup_queue_with_data(mem: &Arc<MemStore>, queue: &QueueId, count: usize) -> Vec<UintN> {
-    mem.start_queue(queue, None, false);
+    mem.start_queue(queue, None, false, PoolKind::Active);
 
     let data = create_test_data(count);
     let mut ids = Vec::new();
 
     for d in data {
-        let id = mem.enqueue(queue, d);
+        let id = mem.enqueue_awaiting(queue, d).await.expect("queue is open").0;
         ids.push(id);
     }
 
@@ -294,7 +295,7 @@ async fn test_follow_full_positive_subscribe() {
 
     // Add new entries
     let new_data = Bytes::from("new_data_1");
-    let new_id = mem.enqueue(&queue, new_data.clone());
+    let new_id = mem.enqueue_awaiting(&queue, new_data.clone()).await.expect("queue is open").0;
 
     // Give subscription callback time to fire
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -353,7 +354,7 @@ async fn test_follow_full_negative_subscribe() {
 
     // Add new entry
     let new_data = Bytes::from("new_data");
-    let new_id = mem.enqueue(&queue, new_data.clone());
+    let new_id = mem.enqueue_awaiting(&queue, new_data.clone()).await.expect("queue is open").0;
 
     // Give subscription callback time to fire
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -410,9 +411,9 @@ async fn test_follow_full_with_step() {
     assert_eq!(received[3].id, ids[9]);
 
     // Add 3 new entries
-    mem.enqueue(&queue, Bytes::from("data_10")); // id[10]
-    mem.enqueue(&queue, Bytes::from("data_11")); // id[11]
-    let id_12 = mem.enqueue(&queue, Bytes::from("data_12")); // id[12]
+    mem.enqueue_awaiting(&queue, Bytes::from("data_10")).await.expect("queue is open").0; // id[10]
+    mem.enqueue_awaiting(&queue, Bytes::from("data_11")).await.expect("queue is open").0; // id[11]
+    let id_12 = mem.enqueue_awaiting(&queue, Bytes::from("data_12")).await.expect("queue is open").0; // id[12]
 
     // Give subscription callback time to fire
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -477,7 +478,7 @@ async fn test_follow_full_empty_queue() {
     let queue = resolver.resolve("empty_queue");
 
     // Initialize empty queue
-    mem.start_queue(&queue, None, false);
+    mem.start_queue(&queue, None, false, PoolKind::Active);
 
     // Test: Try to follow empty queue
     let (tx, mut rx) = mpsc::channel(100);
@@ -504,7 +505,7 @@ async fn test_follow_full_empty_queue() {
 
     // Add new entry
     let new_data = Bytes::from("first_entry");
-    let new_id = mem.enqueue(&queue, new_data.clone());
+    let new_id = mem.enqueue_awaiting(&queue, new_data.clone()).await.expect("queue is open").0;
 
     // Give subscription callback time to fire
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -553,7 +554,7 @@ async fn test_channel_closed_unsubscribes() {
     drop(tx);
 
     // Add new entry - subscription callback should detect closed channel and unsubscribe
-    mem.enqueue(&queue, Bytes::from("trigger_callback"));
+    mem.enqueue_awaiting(&queue, Bytes::from("trigger_callback")).await.expect("queue is open").0;
 
     // Give callback time to fire and unsubscribe
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -572,13 +573,13 @@ async fn test_bounded_cache_drops_old_unacked_and_falls_back() {
     let mem = Arc::new(mem_store(2 * TEST_PAGE_SIZE));
     let resolver = QueueIdResolver::new(TEST_INSTANCE_ID);
     let queue = resolver.resolve("bounded_queue");
-    mem.start_queue(&queue, None, false);
+    mem.start_queue(&queue, None, false, PoolKind::Active);
 
     let big = Bytes::from(vec![7u8; 100 * 1024]);
-    let id0 = mem.enqueue(&queue, big.clone());
+    let id0 = mem.enqueue_awaiting(&queue, big.clone()).await.expect("queue is open").0;
     let mut newest = id0.clone();
     for _ in 0..7 {
-        newest = mem.enqueue(&queue, big.clone());
+        newest = mem.enqueue_awaiting(&queue, big.clone()).await.expect("queue is open").0;
     }
 
     // Newest id is cached and served from memory.
@@ -606,7 +607,7 @@ async fn every_queue_holds_a_disjoint_range_of_the_one_arena() {
     // which is what makes `max_memory_usage` a total rather than a per-queue
     // allowance.
     let mem = Arc::new(
-        MemStore::with_page_size(16 * 1024, 1024).expect("test budget holds a queue's floor"),
+        MemStore::with_pools(16 * 1024, 1024, 64 * 1024, 1024).expect("test budget holds a queue's floor"),
     );
     let resolver = QueueIdResolver::new(TEST_INSTANCE_ID);
     let arena = mem.arena().clone();
@@ -614,8 +615,8 @@ async fn every_queue_holds_a_disjoint_range_of_the_one_arena() {
 
     let a = resolver.resolve("qa");
     let b = resolver.resolve("qb");
-    mem.start_queue(&a, None, false);
-    mem.start_queue(&b, None, false);
+    mem.start_queue(&a, None, false, PoolKind::Active);
+    mem.start_queue(&b, None, false, PoolKind::Active);
 
     let ra = mem.pool(&a).unwrap().slot_range().expect("a pooled queue");
     let rb = mem.pool(&b).unwrap().slot_range().expect("a pooled queue");
@@ -649,11 +650,11 @@ async fn a_busy_queue_takes_a_page_rather_than_waiting_for_the_disk() {
     // waited for its own records to reach disk however much of the arena was
     // sitting idle next to it.
     let mem = Arc::new(
-        MemStore::with_page_size(16 * 1024, 1024).expect("test budget holds a queue's floor"),
+        MemStore::with_pools(16 * 1024, 1024, 64 * 1024, 1024).expect("test budget holds a queue's floor"),
     );
     let resolver = QueueIdResolver::new(TEST_INSTANCE_ID);
     let queue = resolver.resolve("busy");
-    mem.start_queue(&queue, None, false);
+    mem.start_queue(&queue, None, false, PoolKind::Active);
 
     let pool = mem.pool(&queue).unwrap();
     let started_with = pool.page_count();
@@ -699,7 +700,7 @@ async fn the_page_budget_is_a_total_across_queues() {
     let mut total_pages = 0usize;
     for i in 0..queues {
         let queue = resolver.resolve(&format!("q{i}"));
-        mem.start_queue(&queue, None, false);
+        mem.start_queue(&queue, None, false, PoolKind::Active);
         total_pages += mem
             .pool(&queue)
             .expect("a started queue has a pool")
@@ -725,14 +726,14 @@ async fn a_read_only_queue_does_not_reserve_a_writers_share() {
     // a writer's share here is memory an unauthenticated caller can reserve and
     // never release. Nothing appends to such a queue, so the share sits idle.
     let mem = Arc::new(
-        MemStore::with_page_size(64 * 1024, 1024).expect("test budget holds a queue's floor"),
+        MemStore::with_pools(64 * 1024, 1024, 64 * 1024, 1024).expect("test budget holds a queue's floor"),
     );
     let resolver = QueueIdResolver::new(TEST_INSTANCE_ID);
 
     let reader = resolver.resolve("reader");
     let writer = resolver.resolve("writer");
-    mem.start_queue(&reader, None, true);
-    mem.start_queue(&writer, None, false);
+    mem.start_queue(&reader, None, true, PoolKind::Active);
+    mem.start_queue(&writer, None, false, PoolKind::Active);
 
     let read_pages = mem.pool(&reader).unwrap().page_count();
     let write_pages = mem.pool(&writer).unwrap().page_count();
@@ -750,11 +751,11 @@ async fn a_promoted_reader_grows_rather_than_keeping_its_floor() {
     // to be cheap. A queue that starts read-only and is then written to takes
     // what it needs from the arena on its first busy moment.
     let mem = Arc::new(
-        MemStore::with_page_size(16 * 1024, 1024).expect("test budget holds a queue's floor"),
+        MemStore::with_pools(16 * 1024, 1024, 64 * 1024, 1024).expect("test budget holds a queue's floor"),
     );
     let resolver = QueueIdResolver::new(TEST_INSTANCE_ID);
     let queue = resolver.resolve("promoted");
-    mem.start_queue(&queue, None, true);
+    mem.start_queue(&queue, None, true, PoolKind::Active);
 
     let pool = mem.pool(&queue).unwrap();
     let started_with = pool.page_count();
@@ -783,13 +784,16 @@ async fn a_cancelled_enqueue_leaves_no_gap_in_the_id_sequence() {
     let mem = Arc::new(mem_store(1024 * 1024));
     let resolver = QueueIdResolver::new(TEST_INSTANCE_ID);
     let queue = resolver.resolve("cancel_queue");
-    mem.start_queue(&queue, None, false);
+    mem.start_queue(&queue, None, false, PoolKind::Active);
 
     let pool = mem.pool(&queue).unwrap();
     pool.set_drainer();
     pool.arm_file_fill(1 << 20, 16);
 
-    let (first, _) = mem.enqueue_awaiting(&queue, Bytes::from_static(b"first")).await;
+    let (first, _) = mem
+        .enqueue_awaiting(&queue, Bytes::from_static(b"first"))
+        .await
+        .expect("the queue is set up");
 
     // Fill every page, so the next enqueue must wait -- and is then cancelled.
     let block = Bytes::from(vec![0u8; 200 * 1024]);
@@ -823,7 +827,8 @@ async fn a_cancelled_enqueue_leaves_no_gap_in_the_id_sequence() {
     pool.mark_durable(pool.next_entry_id());
     let (next, _) = mem
         .enqueue_awaiting(&queue, Bytes::from_static(b"after"))
-        .await;
+        .await
+        .expect("the queue is set up");
     let expected = last_before.map_or(0, |id| id.to_u64().unwrap() + 1);
     assert_eq!(next.to_u64().unwrap(), expected, "ids must stay dense");
     assert!(next.to_u64().unwrap() > first.to_u64().unwrap());
@@ -840,7 +845,7 @@ async fn a_follow_with_an_unservable_backlog_fails_to_the_files() {
     let mem = Arc::new(mem_store(1024 * 1024));
     let resolver = QueueIdResolver::new(TEST_INSTANCE_ID);
     let queue = resolver.resolve("floor_follow");
-    mem.start_queue(&queue, None, false);
+    mem.start_queue(&queue, None, false, PoolKind::Active);
 
     let pool = mem.pool(&queue).unwrap();
     pool.set_drainer();
@@ -851,13 +856,13 @@ async fn a_follow_with_an_unservable_backlog_fails_to_the_files() {
     let wide = Bytes::from(vec![7u8; normfs_wal::max_record_len(TEST_PAGE_SIZE)]);
     let pages = pool.page_count();
     for _ in 0..pages {
-        mem.enqueue_awaiting(&queue, wide.clone()).await;
+        let _ = mem.enqueue_awaiting(&queue, wide.clone()).await;
     }
     for (w, _) in pool.take_pending(0) {
         pool.commit_written(&w);
     }
     pool.mark_durable(pages as u64);
-    mem.enqueue_awaiting(&queue, wide.clone()).await;
+    let _ = mem.enqueue_awaiting(&queue, wide.clone()).await;
 
     assert!(
         pool.min_cached_id().is_some_and(|m| m > 0),
@@ -881,11 +886,11 @@ fn a_page_below_the_ring_minimum_is_refused() {
     // The C contracts require a page to hold one empty record's frame and its
     // offset slot; past this check the arena panics instead of erroring.
     assert!(matches!(
-        MemStore::with_page_size(16, 8),
+        MemStore::with_pools(16, 8, 64 * 1024, 1024),
         Err(crate::Error::PageBelowMinimum { page_size: 8, .. })
     ));
     assert!(matches!(
-        MemStore::with_page_size(0, 0),
+        MemStore::with_pools(0, 0, 64 * 1024, 1024),
         Err(crate::Error::PageBelowMinimum { page_size: 0, .. })
     ));
 }
@@ -899,7 +904,7 @@ async fn a_follow_into_an_empty_ring_with_a_disk_backlog_fails_to_the_files() {
     let resolver = QueueIdResolver::new(TEST_INSTANCE_ID);
     let queue = resolver.resolve("empty_follow");
     // Ids 0..=4 exist on disk; memory holds none of them.
-    mem.start_queue(&queue, Some(UintN::from(4u64)), false);
+    mem.start_queue(&queue, Some(UintN::from(4u64)), false, PoolKind::Active);
 
     let pool = mem.pool(&queue).unwrap();
     assert_eq!(
@@ -915,5 +920,249 @@ async fn a_follow_into_an_empty_ring_with_a_disk_backlog_fails_to_the_files() {
     assert!(
         !result.success,
         "memory subscribed a follow whose backlog it cannot answer"
+    );
+}
+
+#[test]
+fn a_passive_queue_draws_its_floor_from_the_passive_arena() {
+    let mem = MemStore::with_pools(1024 * 1024, 4096, 64 * 1024, 1024)
+        .expect("both budgets hold a floor");
+    let resolver = QueueIdResolver::new(TEST_INSTANCE_ID);
+
+    let active_free = mem.arena().free_pages();
+    let passive_free = mem.passive_arena().free_pages();
+
+    let passive = resolver.resolve("startup");
+    mem.start_queue(&passive, None, false, PoolKind::Passive);
+    assert_eq!(
+        mem.arena().free_pages(),
+        active_free,
+        "a passive queue must not touch the active arena"
+    );
+    assert_eq!(
+        mem.passive_arena().free_pages(),
+        passive_free - 2,
+        "a passive queue starts at the floor even in write mode: rare \
+         writers are why its arena exists"
+    );
+
+    let active = resolver.resolve("cam0");
+    mem.start_queue(&active, None, false, PoolKind::Active);
+    assert_eq!(
+        mem.passive_arena().free_pages(),
+        passive_free - 2,
+        "an active queue must not touch the passive arena"
+    );
+    assert!(
+        mem.arena().free_pages() < active_free,
+        "an active queue takes its share from the active arena"
+    );
+}
+
+#[test]
+fn a_closed_queue_returns_its_floor_to_the_arena() {
+    let mem = mem_store(64 * TEST_PAGE_SIZE);
+    let resolver = QueueIdResolver::new(TEST_INSTANCE_ID);
+    let free_before = mem.arena().free_pages();
+
+    let queue = resolver.resolve("doomed");
+    mem.start_queue(&queue, None, false, PoolKind::Active);
+    assert!(
+        mem.arena().free_pages() < free_before,
+        "the queue must hold pages for the release to prove anything"
+    );
+
+    // A straggler holding the pool blocks the release: handing its pages to
+    // the next queue while it can still read them would serve one queue's
+    // bytes as another's.
+    let held = mem.pool(&queue).unwrap();
+
+    mem.close_queue(&queue);
+    assert!(
+        mem.arena().free_pages() < free_before,
+        "pages must stay put while a straggler can still read them"
+    );
+    assert!(mem.is_closed(&queue), "close must leave the closed mark");
+
+    // The last holder letting go is what frees them.
+    drop(held);
+    assert_eq!(
+        mem.arena().free_pages(),
+        free_before,
+        "a closed queue's pages must go back to the arena once unheld"
+    );
+
+    // And with no straggler, the release is immediate.
+    let queue2 = resolver.resolve("doomed2");
+    mem.start_queue(&queue2, None, false, PoolKind::Active);
+    let free_mid = mem.arena().free_pages();
+    assert!(free_mid < free_before);
+    mem.close_queue(&queue2);
+    assert_eq!(
+        mem.arena().free_pages(),
+        free_before,
+        "an unheld closed queue's pages must return at close time"
+    );
+}
+
+#[tokio::test]
+async fn a_parked_append_whose_drainer_leaves_takes_no_id_and_tells_no_one() {
+    let mem = Arc::new(mem_store(1024 * 1024));
+    let resolver = QueueIdResolver::new(TEST_INSTANCE_ID);
+    let queue = resolver.resolve("closing_park");
+    mem.start_queue(&queue, None, false, PoolKind::Active);
+
+    let pool = mem.pool(&queue).unwrap();
+    pool.set_drainer();
+    pool.arm_file_fill(1 << 20, 16);
+
+    // Fill every page so the next append parks.
+    let block = Bytes::from(vec![0u8; 200 * 1024]);
+    for _ in 0..8 {
+        let placed = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            mem.enqueue_awaiting(&queue, block.clone()),
+        )
+        .await;
+        if placed.is_err() {
+            break;
+        }
+    }
+    let last_before = mem.get_last_id(&queue).flatten();
+
+    // Park an append, then take the drainer away, the way a close does.
+    let parked = tokio::spawn({
+        let mem = mem.clone();
+        let queue = queue.clone();
+        let block = block.clone();
+        async move { mem.enqueue_awaiting(&queue, block).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    pool.clear_drainer();
+
+    let refused = tokio::time::timeout(std::time::Duration::from_secs(5), parked)
+        .await
+        .expect("the parked append must return once the drainer leaves")
+        .unwrap();
+    assert!(
+        refused.is_none(),
+        "a record that reaches no file must not be accepted, got {refused:?}"
+    );
+    assert_eq!(
+        mem.get_last_id(&queue).flatten(),
+        last_before,
+        "a refused record must not consume an id"
+    );
+}
+
+/// The enqueue/close race in miniature: a record placed in a page whose
+/// `Write` message never reaches the writer. The closing flush cannot see
+/// it, so certifying the close would write a marker over a record that no
+/// recovery can show.
+#[tokio::test]
+async fn a_close_cannot_certify_a_record_the_flush_never_saw() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let mut settings = crate::NormFsSettings::all_active();
+    // No autonomous flush tick: the record must stay unflushed.
+    settings.wal_settings.write_interval = std::time::Duration::from_secs(3600);
+    let fs = crate::NormFS::new(temp.path().to_path_buf(), settings)
+        .await
+        .unwrap();
+    let queue = fs.resolve("racy");
+    fs.ensure_queue_exists_for_write(&queue).await.unwrap();
+    fs.enqueue(&queue, Bytes::from_static(b"flushed"))
+        .await
+        .unwrap();
+
+    fs.mem
+        .enqueue_awaiting(&queue, Bytes::from_static(b"placed, never sent"))
+        .await
+        .expect("the queue is open; the record is placed");
+
+    let closed = fs.close_queue(&queue).await;
+    assert!(
+        matches!(
+            closed,
+            Err(crate::Error::Wal(normfs_wal::WalError::CloseIncomplete))
+        ),
+        "a close must refuse to certify while an accepted record is not on \
+         disk, got {closed:?}"
+    );
+    assert!(
+        !queue.to_fs_path(temp.path()).join("closed").is_file(),
+        "no marker may exist for an uncertified close"
+    );
+}
+
+/// The confirmed close race: an append parked on a full pool holds the gate
+/// while a close begins. The close must not become visible with a bound the
+/// parked append is about to move past, and the bound it records must be the
+/// id that append actually took.
+#[tokio::test]
+async fn a_close_waits_for_a_parked_append_and_records_its_id() {
+    let mem = Arc::new(mem_store(1024 * 1024));
+    let resolver = QueueIdResolver::new(TEST_INSTANCE_ID);
+    let queue = resolver.resolve("closing_race");
+    mem.start_queue(&queue, None, false, PoolKind::Active);
+
+    let pool = mem.pool(&queue).unwrap();
+    pool.set_drainer();
+    pool.arm_file_fill(1 << 20, 16);
+
+    let block = Bytes::from(vec![0u8; 200 * 1024]);
+    for _ in 0..8 {
+        let placed = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            mem.enqueue_awaiting(&queue, block.clone()),
+        )
+        .await;
+        if placed.is_err() {
+            break;
+        }
+    }
+
+    // Park an append; it holds the gate at the wait for a page.
+    let parked = tokio::spawn({
+        let mem = mem.clone();
+        let queue = queue.clone();
+        let block = block.clone();
+        async move { mem.enqueue_awaiting(&queue, block).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let closing = tokio::spawn({
+        let mem = mem.clone();
+        let queue = queue.clone();
+        async move { mem.begin_close(&queue).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !mem.is_closed(&queue),
+        "the close must not be visible while an accepted append can still move \
+         the last id"
+    );
+
+    // Free pages; the parked append completes and takes its id.
+    for (w, _) in pool.take_pending(0) {
+        pool.commit_written(&w);
+    }
+    pool.mark_durable(pool.next_entry_id());
+
+    let placed = tokio::time::timeout(std::time::Duration::from_secs(5), parked)
+        .await
+        .expect("the parked append must resume once pages are free")
+        .unwrap()
+        .expect("the append was accepted before the close became visible");
+    tokio::time::timeout(std::time::Duration::from_secs(5), closing)
+        .await
+        .expect("begin_close must return once the gate is free")
+        .unwrap();
+
+    assert!(mem.is_closed(&queue));
+    assert_eq!(
+        mem.closed_last_id(&queue),
+        Some(placed.0),
+        "the recorded bound must be the id the parked append took, or every \
+         follow ends one record early forever"
     );
 }

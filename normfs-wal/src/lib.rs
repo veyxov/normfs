@@ -272,6 +272,16 @@ impl WalStore {
         writers.contains_key(queue_id)
     }
 
+    /// Flushes, fsyncs, and completes one queue's file. No writer means
+    /// nothing to do, not an error.
+    pub async fn close_writer(&self, queue_id: &QueueId) -> Result<(), WalError> {
+        let writer = self.writers.write().unwrap().remove(queue_id);
+        match writer {
+            Some(writer) => writer.close().await,
+            None => Ok(()),
+        }
+    }
+
     pub async fn start_writer(
         &self,
         queue: &QueueId,
